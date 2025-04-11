@@ -4,28 +4,36 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 )
 
+// Тип для хранения информации о переменной
 type Variable struct {
-	isInt bool
-	value float64
+	isInt bool    // true, если переменная целая
+	value float64 // текущее числовое значение (даже для целых храним в float64, чтобы упрощать вычисления)
 }
 
+// Тип для хранения информации о функции
 type Function struct {
-	params     []string
-	expression string
+	params     []string // имена параметров
+	expression string   // строка-выражение (парсится при вычислении)
 }
 
+// Глобальные карты для хранения переменных и функций
 var variables = make(map[string]*Variable)
 var functions = make(map[string]*Function)
 
-func setVariable(name string, isInt bool, val float64) {
-	if v, ok := variables[name]; ok {
-		isInt = v.isInt
+// === Вспомогательные функции для хранения/поиска переменных и функций ===
 
+func setVariable(name string, isInt bool, val float64) {
+	// Если переменная уже существует, используем уже заданный тип (при отсутствии явной инициализации)
+	if v, ok := variables[name]; ok {
+		// Приведение типа, если нужно
+		isInt = v.isInt
 		if isInt {
+			// Транкция (округление к 0) при записи в целую переменную
 			v.value = float64(int64(val))
 		} else {
 			v.value = val
@@ -33,8 +41,9 @@ func setVariable(name string, isInt bool, val float64) {
 		return
 	}
 
+	// Если переменная новая
 	if isInt {
-		val = float64(int64(val))
+		val = float64(int64(val)) // округляем для целочисленной
 	}
 	variables[name] = &Variable{isInt: isInt, value: val}
 }
@@ -56,6 +65,9 @@ func getFunction(name string) (*Function, bool) {
 	return f, ok
 }
 
+// === Парсер выражений (упрощённый рекурсивный спуск) ===
+
+// Токенизация
 type TokenType int
 
 const (
@@ -103,6 +115,7 @@ func (l *Lexer) peekRune() rune {
 }
 
 func (l *Lexer) NextToken() Token {
+	// Пропускаем пробелы
 	for unicode.IsSpace(l.peekRune()) {
 		l.nextRune()
 	}
@@ -112,6 +125,7 @@ func (l *Lexer) NextToken() Token {
 		return Token{typ: TokenEOF, value: ""}
 	}
 
+	// Разбираем спецсимволы
 	switch r {
 	case '+':
 		l.nextRune()
@@ -136,6 +150,7 @@ func (l *Lexer) NextToken() Token {
 		return Token{typ: TokenComma, value: ","}
 	}
 
+	// Числа (упрощённо)
 	if unicode.IsDigit(r) {
 		startPos := l.pos
 		dotCount := 0
@@ -152,6 +167,7 @@ func (l *Lexer) NextToken() Token {
 		return Token{typ: TokenNumber, value: numStr}
 	}
 
+	// Идентификаторы (имена переменных/функций)
 	if unicode.IsLetter(r) || r == '_' {
 		startPos := l.pos
 		for unicode.IsLetter(l.peekRune()) || unicode.IsDigit(l.peekRune()) || l.peekRune() == '_' {
@@ -161,15 +177,207 @@ func (l *Lexer) NextToken() Token {
 		return Token{typ: TokenIdent, value: ident}
 	}
 
+	// Если что-то непонятное, считаем ошибкой
 	return Token{typ: TokenError, value: string(r)}
 }
+
+// Рекурсивный спуск:
+// expr = term { ("+" | "-") term }
+// term = factor { ("*" | "/") factor }
+// factor = number | ident [ "(" exprlist ")" ] | "(" expr ")"
+// exprlist = expr { "," expr }
+
+type Parser struct {
+	lexer  *Lexer
+	curr   Token
+	errMsg string
+}
+
+func NewParser(input string) *Parser {
+	p := &Parser{lexer: NewLexer(input)}
+	p.next()
+	return p
+}
+
+func (p *Parser) next() {
+	p.curr = p.lexer.NextToken()
+}
+
+func (p *Parser) error(msg string) {
+	p.errMsg = msg
+}
+
+func (p *Parser) parseExpression() float64 {
+	val := p.parseTerm()
+	for p.curr.typ == TokenPlus || p.curr.typ == TokenMinus {
+		op := p.curr.typ
+		p.next()
+		right := p.parseTerm()
+		if op == TokenPlus {
+			val += right
+		} else {
+			val -= right
+		}
+	}
+	return val
+}
+
+func (p *Parser) parseTerm() float64 {
+	val := p.parseFactor()
+	for p.curr.typ == TokenStar || p.curr.typ == TokenSlash {
+		op := p.curr.typ
+		p.next()
+		right := p.parseFactor()
+		if op == TokenStar {
+			val *= right
+		} else {
+			// деление
+			if right == 0 {
+				// В реальном интерпретаторе нужно как-то обрабатывать деление на ноль.
+				// Здесь просто разделим на 0.0, что даст +Inf/-Inf.
+				val = val / 0.0
+			} else {
+				val /= right
+			}
+		}
+	}
+	return val
+}
+
+func (p *Parser) parseFactor() float64 {
+	switch p.curr.typ {
+	case TokenNumber:
+		// конвертируем в float64
+		f, err := strconv.ParseFloat(p.curr.value, 64)
+		if err != nil {
+			p.error("Невозможно преобразовать число: " + p.curr.value)
+			return 0
+		}
+		p.next()
+		return f
+	case TokenIdent:
+		// Может быть переменная, может быть вызов функции
+		identName := p.curr.value
+		p.next()
+		if p.curr.typ == TokenLParen {
+			// вызов функции
+			// Считываем аргументы
+			p.next() // пропускаем '('
+			args := []float64{}
+			if p.curr.typ != TokenRParen {
+				for {
+					argVal := p.parseExpression()
+					args = append(args, argVal)
+					if p.curr.typ == TokenComma {
+						p.next()
+						continue
+					}
+					break
+				}
+			}
+			if p.curr.typ != TokenRParen {
+				p.error("Ожидалась закрывающая скобка в вызове функции")
+				return 0
+			}
+			p.next() // пропускаем ')'
+
+			// Ищем функцию
+			fn, ok := getFunction(identName)
+			if !ok {
+				// Ошибка: функция не найдена
+				fmt.Printf("ОШИБКА: использование не объявленной функции \"%s\"\n", identName)
+				return 0
+			}
+
+			// Проверка числа параметров
+			if len(fn.params) != len(args) {
+				p.error(fmt.Sprintf("Функция %s ожидала %d аргументов, передано %d",
+					identName, len(fn.params), len(args)))
+				return 0
+			}
+
+			// Вычисляем путём временного создания окружения
+			return evaluateFunction(fn, args)
+		} else {
+			// переменная
+			v, ok := getVariable(identName)
+			if !ok {
+				// Ошибка: переменная не найдена
+				fmt.Printf("ОШИБКА: использование не объявленной переменной \"%s\"\n", identName)
+				return 0
+			}
+			return v.value
+		}
+	case TokenLParen:
+		p.next()
+		val := p.parseExpression()
+		if p.curr.typ != TokenRParen {
+			p.error("Ожидалась закрывающая скобка )")
+			return val
+		}
+		p.next()
+		return val
+	default:
+		p.error("Неожиданный токен: " + p.curr.value)
+		return 0
+	}
+}
+
+// evaluateFunction – вычисляет тело функции, подставляя аргументы в параметры.
+// Для простоты делаем: во время вычисления выражения функции создаём «временные» переменные с именами параметров
+// и после вычисления восстанавливаем старые значения (или отсутствие таковых).
+func evaluateFunction(fn *Function, args []float64) float64 {
+	// Сохраним текущее состояние переменных, которые совпадают с именами параметров.
+	backup := make(map[string]*Variable)
+	// Для каждого параметра создаём/перезаписываем переменную
+	for i, paramName := range fn.params {
+		if orig, found := getVariable(paramName); found {
+			backup[paramName] = &Variable{isInt: orig.isInt, value: orig.value}
+		}
+		// При подстановке аргументов типа не знаем, пусть будет float, если дробь – значит float.
+		isInteger := float64(int64(args[i])) == args[i]
+		setVariable(paramName, isInteger, args[i])
+	}
+
+	// Вычислим выражение
+	p := NewParser(fn.expression)
+	val := p.parseExpression()
+	if p.errMsg != "" {
+		fmt.Println("ОШИБКА при вычислении функции:", p.errMsg)
+	}
+
+	// Восстановим старые значения переменных
+	for _, paramName := range fn.params {
+		// Удаляем временную переменную (или восстанавливаем из backup)
+		delete(variables, paramName)
+		if bkp, ok := backup[paramName]; ok {
+			// восстановить
+			variables[paramName] = bkp
+		}
+	}
+
+	return val
+}
+
+// evaluateExpression – вспомогательная функция для вычисления произвольной строки-выражения
+func evaluateExpression(expr string) (float64, bool) {
+	p := NewParser(expr)
+	val := p.parseExpression()
+	if p.errMsg != "" {
+		fmt.Println("ОШИБКА при вычислении выражения:", p.errMsg)
+		return 0, false
+	}
+	return val, true
+}
+
+// === Разбор инструкций ===
 
 func processLine(line string) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return
 	}
-	// Убираем trailing ';'
+	// Убираем trailing ';' (по условию – каждая инструкция заканчивается точкой с запятой)
 	if strings.HasSuffix(line, ";") {
 		line = line[:len(line)-1]
 	}
@@ -211,9 +419,10 @@ func processLine(line string) {
 		return
 	}
 
-	// 2) Проверим, не функция ли это
+	// 2) Проверим, не функция ли это:  name(arg1, arg2, ...): выражение
 	//    Признак – наличие двоеточия ':' после списка параметров
 	if strings.Contains(line, ":") {
+		// Пример: foo(x, y): (x*y+2)...
 		parts := strings.SplitN(line, ":", 2)
 		left := strings.TrimSpace(parts[0])  // foo(x, y)
 		right := strings.TrimSpace(parts[1]) // (x*y+2)...
@@ -237,12 +446,13 @@ func processLine(line string) {
 			}
 		}
 
-		// Сохраняем функцию
+		// Сохраняем функцию в карту
 		setFunction(funcName, paramNames, right)
 		return
 	}
 
-	// 3) Проверим, не инициализация ли это переменной
+	// 3) Проверим, не инициализация ли переменной с типом:  varName(i)=...  или varName(f)=...
+	//    Ищем шаблон:  что-то(...)=<что-то>
 	if strings.Contains(line, ")=") {
 		// Пример: myvar(i)=15
 		parts := strings.SplitN(line, ")=", 2)
@@ -301,19 +511,18 @@ func processLine(line string) {
 
 	// Если ничего из вышеперечисленного не подошло, считаем строку некорректной
 	fmt.Println("ОШИБКА: не могу разобрать инструкцию:", line)
-
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Передай файл")
+		fmt.Println("Использование: go run main.go <путь_к_файлу_инструкций>")
 		return
 	}
 
 	fileName := os.Args[1]
 	file, err := os.Open(fileName)
 	if err != nil {
-		fmt.Println("Ошибка открытия файла: ", err)
+		fmt.Println("Ошибка открытия файла:", err)
 		return
 	}
 	defer file.Close()
@@ -321,10 +530,13 @@ func main() {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+		processLine(line)
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Ошибка чтения файла", err)
+		fmt.Println("Ошибка чтения файла:", err)
 		return
 	}
 
+	variables = nil
+	functions = nil
 }
